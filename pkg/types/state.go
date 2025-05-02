@@ -3,7 +3,10 @@ package types
 import (
 	"fmt"
 	"main/pkg/utils"
+	"maps"
+	"math/big"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +21,14 @@ type State struct {
 	StartTime                    time.Time
 	Upgrade                      *Upgrade
 	BlockTime                    time.Duration
+	NetInfo                      *NetInfo
+
+	validatorsByPeerID map[string]Validator
+
+	currentRPC string
+	knownRPCs  *utils.OrderedMap[string, RPC]
+	rpcPeers   *utils.OrderedMap[string, []Peer]
+	muRPCs     *sync.RWMutex
 
 	ConsensusStateError  error
 	ValidatorsError      error
@@ -26,16 +37,138 @@ type State struct {
 	ChainInfoError       error
 }
 
-func NewState() *State {
-	return &State{
-		Height:          0,
-		Round:           0,
-		Step:            0,
-		Validators:      nil,
-		ChainValidators: nil,
-		StartTime:       time.Now(),
-		BlockTime:       0,
+type RPC struct {
+	ID               string `json:"id"`
+	IP               string `json:"ip"`
+	URL              string `json:"url"`
+	Moniker          string `json:"moniker"`
+	ValidatorAddress string `json:"validatorAddress"`
+	ValidatorMoniker string `json:"validatorMoniker"`
+}
+
+func NewRPCFromPeer(peer Peer) RPC {
+	return RPC{
+		ID:      string(peer.NodeInfo.DefaultNodeID),
+		IP:      peer.RemoteIP,
+		URL:     peer.URL(),
+		Moniker: peer.NodeInfo.Moniker,
 	}
+}
+
+func NewState(firstRPC string) *State {
+	return &State{
+		Height:             0,
+		Round:              0,
+		Step:               0,
+		Validators:         nil,
+		ChainValidators:    nil,
+		validatorsByPeerID: make(map[string]Validator),
+		StartTime:          time.Now(),
+		BlockTime:          0,
+		currentRPC:         firstRPC,
+		knownRPCs:          utils.NewOrderedMap[string, RPC](),
+		rpcPeers:           utils.NewOrderedMap[string, []Peer](),
+		muRPCs:             &sync.RWMutex{},
+	}
+}
+
+func (s *State) Clear() {
+	s.Height = 0
+	s.Round = 0
+	s.Step = 0
+	s.Validators = nil
+	s.ValidatorsWithAllRoundsVotes = nil
+	s.ChainValidators = nil
+	s.ChainInfo = nil
+	s.StartTime = time.Now()
+	s.Upgrade = nil
+	s.BlockTime = time.Duration(0)
+	s.NetInfo = nil
+	s.ConsensusStateError = nil
+	s.ValidatorsError = nil
+	s.ChainValidatorsError = nil
+	s.UpgradePlanError = nil
+	s.ChainInfoError = nil
+}
+
+func (s *State) CurrentRPC() RPC {
+	s.muRPCs.RLock()
+	defer s.muRPCs.RUnlock()
+
+	rpc, ok := s.knownRPCs.Get(s.currentRPC)
+	if !ok {
+		return RPC{URL: s.currentRPC}
+	}
+	return rpc
+}
+
+func (s *State) SetCurrentRPCURL(rpcURL string) {
+	s.muRPCs.Lock()
+	defer s.muRPCs.Unlock()
+
+	s.currentRPC = rpcURL
+}
+
+func (s *State) KnownRPCByURL(url string) (RPC, bool) {
+	s.muRPCs.RLock()
+	defer s.muRPCs.RUnlock()
+
+	rpc, ok := s.knownRPCs.Get(url)
+	return rpc, ok
+}
+
+func (s *State) KnownRPCs() *utils.OrderedMap[string, RPC] {
+	s.muRPCs.RLock()
+	defer s.muRPCs.RUnlock()
+
+	return s.knownRPCs.Copy()
+}
+
+func (s *State) AddKnownRPC(rpc RPC) {
+	s.muRPCs.Lock()
+	defer s.muRPCs.Unlock()
+
+	s.knownRPCs.Set(rpc.URL, rpc)
+}
+
+func (s *State) IsKnownRPC(rpcURL string) bool {
+	s.muRPCs.RLock()
+	defer s.muRPCs.RUnlock()
+
+	_, ok := s.knownRPCs.Get(rpcURL)
+	return ok
+}
+
+func (s *State) RPCAtIndex(index int) (RPC, bool) {
+	s.muRPCs.RLock()
+	defer s.muRPCs.RUnlock()
+
+	_, rpc, ok := s.knownRPCs.GetByIndex(index)
+	return rpc, ok
+}
+
+func (s *State) AddRPCPeers(rpcURL string, peers []Peer) {
+	s.muRPCs.Lock()
+	defer s.muRPCs.Unlock()
+
+	s.rpcPeers.Set(rpcURL, peers)
+}
+
+func (s *State) RPCPeers(rpcURL string) []Peer {
+	s.muRPCs.RLock()
+	defer s.muRPCs.RUnlock()
+
+	peers, _ := s.rpcPeers.Get(rpcURL)
+	return peers
+}
+
+func (s *State) ValidatorByPeerID(peerID string) (Validator, bool) {
+	val, ok := s.validatorsByPeerID[strings.ToLower(peerID)]
+	return val, ok
+}
+
+func (s *State) ValidatorsByPeerID() map[string]Validator {
+	return maps.Clone(s.validatorsByPeerID)
 }
 
 func (s *State) SetTendermintResponse(
@@ -63,6 +196,10 @@ func (s *State) SetTendermintResponse(
 
 	s.ValidatorsWithAllRoundsVotes = &validatorsWithAllRounds
 
+	for _, val := range validators {
+		s.validatorsByPeerID[strings.ToLower(string(val.Validator.PeerID))] = val.Validator
+	}
+
 	return nil
 }
 
@@ -80,6 +217,10 @@ func (s *State) SetUpgrade(upgrade *Upgrade) {
 
 func (s *State) SetBlockTime(blockTime time.Duration) {
 	s.BlockTime = blockTime
+}
+
+func (s *State) SetNetInfo(info *NetInfo) {
+	s.NetInfo = info
 }
 
 func (s *State) SetConsensusStateError(err error) {
@@ -126,39 +267,59 @@ func (s *State) SerializeConsensus(timezone *time.Location) string {
 		s.Validators.GetTotalVotingPowerPrecommittedPercent(false),
 	))
 
-	prevoted := 0
-	precommitted := 0
-	prevotedAgreed := 0
-	precommittedAgreed := 0
+	var (
+		prevoted           *big.Float = big.NewFloat(0)
+		precommitted       *big.Float = big.NewFloat(0)
+		prevotedAgreed     *big.Float = big.NewFloat(0)
+		precommittedAgreed *big.Float = big.NewFloat(0)
+	)
 
 	for _, validator := range *s.Validators {
+		// keeps round alive, didn't see valid proposal (tendermint layer)
 		if validator.RoundVote.Prevote != VotedNil {
-			prevoted += 1
+			prevoted = big.NewFloat(0).Add(prevoted, validator.Validator.VotingPowerPercent)
 		}
 		if validator.RoundVote.Precommit != VotedNil {
-			precommitted += 1
+			precommitted = big.NewFloat(0).Add(precommitted, validator.Validator.VotingPowerPercent)
 		}
 
+		// could restart/end the round (cosmos layer) -- “non-locked” or “no-precommit”
 		if validator.RoundVote.Prevote == Voted {
-			prevotedAgreed += 1
+			prevotedAgreed = big.NewFloat(0).Add(prevotedAgreed, validator.Validator.VotingPowerPercent)
 		}
 
 		if validator.RoundVote.Precommit == Voted {
-			precommittedAgreed += 1
+			precommittedAgreed = big.NewFloat(0).Add(precommittedAgreed, validator.Validator.VotingPowerPercent)
 		}
+
+		// In summary, a **nil vote** reflects that the validator participated but
+		// saw no valid proposal, keeping the round alive, while a **zero vote**
+		// (if referenced) signals a form of abstention or absence of a decision,
+		// which could force the round to restart or timeout.
+	}
+
+	mustFloat := func(x *big.Float) float64 {
+		blah, _ := x.Float64()
+		return blah
 	}
 
 	sb.WriteString(fmt.Sprintf(
-		" prevoted/precommitted: %d/%d (out of %d)\n",
-		prevoted,
-		precommitted,
-		len(*s.Validators),
+		" prevoted/precommitted: %0.2f/%0.2f (out of %0.2f / %0.2f - %0.2f / %0.2f)\n",
+		mustFloat(prevoted),
+		mustFloat(precommitted),
+		mustFloat(s.Validators.GetTotalVotingPowerPrevotedPercent(true)),
+		mustFloat(s.Validators.GetTotalVotingPowerPrecommittedPercent(true)),
+		mustFloat(s.Validators.GetTotalVotingPowerPrevotedPercent(false)),
+		mustFloat(s.Validators.GetTotalVotingPowerPrecommittedPercent(false)),
 	))
 	sb.WriteString(fmt.Sprintf(
-		" prevoted/precommitted agreed: %d/%d (out of %d)\n",
-		prevotedAgreed,
-		precommittedAgreed,
-		len(*s.Validators),
+		" prevoted/precommitted agreed: %0.2f/%0.2f (out of %0.2f / %0.02f - %0.2f / %0.2f)\n",
+		mustFloat(prevotedAgreed),
+		mustFloat(precommittedAgreed),
+		mustFloat(s.Validators.GetTotalVotingPowerPrevotedPercent(true)),
+		mustFloat(s.Validators.GetTotalVotingPowerPrecommittedPercent(true)),
+		mustFloat(s.Validators.GetTotalVotingPowerPrevotedPercent(false)),
+		mustFloat(s.Validators.GetTotalVotingPowerPrecommittedPercent(false)),
 	))
 
 	sb.WriteString(fmt.Sprintf(" last updated at: %s\n", utils.SerializeTime(time.Now().In(timezone))))
@@ -168,6 +329,9 @@ func (s *State) SerializeConsensus(timezone *time.Location) string {
 
 func (s *State) SerializeChainInfo(timezone *time.Location) string {
 	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf(" rpc: %v\n", s.CurrentRPC().URL))
+	sb.WriteString(fmt.Sprintf(" (%v)\n\n", s.CurrentRPC().Moniker))
 
 	if s.ChainInfoError != nil {
 		sb.WriteString(fmt.Sprintf(" chain info fetch error: %s\n", s.ChainInfoError.Error()))

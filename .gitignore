@@ -1,8 +1,13 @@
 main
-*.json
 .idea
 cover.out
 tmtop
 dist
 **/.DS_Store
 out.txt
+
+node_modules/
+
+*.sublime-*
+.omega.json
+.vite
